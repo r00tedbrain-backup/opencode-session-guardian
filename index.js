@@ -249,39 +249,88 @@ export default {
       },
 
       // Filter oversized base64 images from message history
+      // Claude API limits: 8000px single image, 2000px when multiple images
+      // We keep max MAX_IMAGES_IN_CONTEXT images (the most recent ones)
       "experimental.chat.messages.transform": async (_input, output) => {
-        for (const msg of output.messages) {
-          const newParts = [];
-          for (const part of msg.parts) {
-            if (part.type === "file" && part.url) {
-              if (
-                part.url.startsWith("data:image") &&
-                part.url.length > MAX_IMAGE_SIZE_BYTES
-              ) {
-                newParts.push({
-                  ...part,
-                  type: "text",
-                  text: `[SESSION-GUARDIAN] Image removed from context (${(part.url.length / 1024 / 1024).toFixed(1)}MB) to prevent session crash. File: ${part.filename || "screenshot"}`,
-                  url: undefined,
-                });
-                continue;
+        const MAX_IMAGES_IN_CONTEXT = 3;
+
+        // First pass: collect all image locations
+        const allImages = [];
+        for (let mi = 0; mi < output.messages.length; mi++) {
+          const msg = output.messages[mi];
+          for (let pi = 0; pi < msg.parts.length; pi++) {
+            const part = msg.parts[pi];
+            // Direct image file parts
+            if (part.type === "file" && part.url && part.url.startsWith("data:image")) {
+              allImages.push({ mi, pi, size: part.url.length, type: "file" });
+            }
+            // Tool outputs with image attachments
+            if (part.type === "tool" && part.state?.status === "completed" && part.state?.attachments) {
+              for (const att of part.state.attachments) {
+                if (att.url && att.url.startsWith("data:image")) {
+                  allImages.push({ mi, pi, size: att.url.length, type: "tool-attachment" });
+                }
               }
             }
-
-            if (
-              part.type === "tool" &&
-              part.state?.status === "completed" &&
-              part.state?.output &&
-              part.state.output.length > MAX_IMAGE_SIZE_BYTES
-            ) {
-              part.state.output =
-                `[SESSION-GUARDIAN] Output truncated (${(part.state.output.length / 1024 / 1024).toFixed(1)}MB). ` +
-                `Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
+            // Tool outputs that ARE base64 images
+            if (part.type === "tool" && part.state?.status === "completed" && part.state?.output) {
+              if (part.state.output.startsWith("data:image") || part.state.output.length > MAX_IMAGE_SIZE_BYTES) {
+                allImages.push({ mi, pi, size: part.state.output.length, type: "tool-output" });
+              }
             }
-
-            newParts.push(part);
           }
-          msg.parts = newParts;
+        }
+
+        // If too many images, remove all except the last MAX_IMAGES_IN_CONTEXT
+        const imagesToRemove = new Set();
+        if (allImages.length > MAX_IMAGES_IN_CONTEXT) {
+          const toRemove = allImages.slice(0, allImages.length - MAX_IMAGES_IN_CONTEXT);
+          for (const img of toRemove) {
+            imagesToRemove.add(`${img.mi}-${img.pi}`);
+          }
+        }
+
+        // Also always remove any single image >4MB
+        for (const img of allImages) {
+          if (img.size > MAX_IMAGE_SIZE_BYTES) {
+            imagesToRemove.add(`${img.mi}-${img.pi}`);
+          }
+        }
+
+        // Second pass: apply removals
+        if (imagesToRemove.size > 0) {
+          for (let mi = 0; mi < output.messages.length; mi++) {
+            const msg = output.messages[mi];
+            const newParts = [];
+            for (let pi = 0; pi < msg.parts.length; pi++) {
+              const part = msg.parts[pi];
+              const key = `${mi}-${pi}`;
+
+              if (imagesToRemove.has(key)) {
+                if (part.type === "file") {
+                  newParts.push({
+                    ...part,
+                    type: "text",
+                    text: `[SESSION-GUARDIAN] Image removed from context to prevent crash (${allImages.length} images total, keeping last ${MAX_IMAGES_IN_CONTEXT}). File: ${part.filename || "screenshot"}`,
+                    url: undefined,
+                  });
+                } else if (part.type === "tool") {
+                  if (part.state?.output) {
+                    part.state.output = `[SESSION-GUARDIAN] Image output removed (${allImages.length} images in session, limit ${MAX_IMAGES_IN_CONTEXT}). Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
+                  }
+                  if (part.state?.attachments) {
+                    part.state.attachments = [];
+                  }
+                  newParts.push(part);
+                } else {
+                  newParts.push(part);
+                }
+              } else {
+                newParts.push(part);
+              }
+            }
+            msg.parts = newParts;
+          }
         }
       },
 
