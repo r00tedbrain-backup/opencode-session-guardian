@@ -144,6 +144,7 @@ const MAX_IMAGE_SIZE_BYTES = 4 * 1024 * 1024; // 4MB — adjust if needed
 - OpenCode >= 1.0.220
 - Node.js >= 18
 - `@opencode-ai/plugin` >= 1.3.17
+- `sqlite3` CLI (pre-installed on macOS and most Linux — no native Node modules needed)
 
 ## Troubleshooting
 
@@ -151,22 +152,17 @@ const MAX_IMAGE_SIZE_BYTES = 4 * 1024 * 1024; // 4MB — adjust if needed
 
 Check that it's listed in `~/.config/opencode/opencode.json` under `"plugin"` and that the package is installed in `~/.config/opencode/node_modules/`.
 
-### `better-sqlite3` build errors
-
-This plugin uses `better-sqlite3` for direct database access. If you get build errors:
-
-```bash
-cd ~/.config/opencode
-npm rebuild better-sqlite3
-```
-
 ### Recovery tools not showing up
 
 Restart OpenCode after installing the plugin. The tools register on startup.
 
-### Database is locked
+### sqlite3 not found
 
-The plugin opens the database in read-only mode, so it should never conflict with OpenCode's writes. If you see lock errors, try restarting OpenCode.
+The plugin uses the system `sqlite3` CLI (comes pre-installed on macOS and most Linux distros). No native Node.js modules are required. If `sqlite3` isn't available, the plugin falls back to reading JSON files from `~/.local/share/opencode/storage/`.
+
+### Database access
+
+The plugin reads the database via `sqlite3` CLI in read-only mode, so it never conflicts with OpenCode's writes.
 
 ## License
 
