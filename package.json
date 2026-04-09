@@ -1,0 +1,37 @@
+{
+  "name": "opencode-session-guardian",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that prevents session crashes from oversized images/screenshots and recovers context from broken sessions",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "session-recovery",
+    "context-loss",
+    "screenshot-protection",
+    "claude",
+    "ai-coding",
+    "developer-tools"
+  ],
+  "author": "r00tedbrain-backup",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/r00tedbrain-backup/opencode-session-guardian.git"
+  },
+  "bugs": {
+    "url": "https://github.com/r00tedbrain-backup/opencode-session-guardian/issues"
+  },
+  "homepage": "https://github.com/r00tedbrain-backup/opencode-session-guardian#readme",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.3.17",
+    "better-sqlite3": "^12.8.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
