@@ -38,14 +38,7 @@ This plugin fixes that. Permanently.
 
 ## Installation
 
-### 1. Install the plugin
-
-```bash
-cd ~/.config/opencode
-npm install opencode-session-guardian
-```
-
-### 2. Register it in your config
+### 1. Add to your config
 
 Edit `~/.config/opencode/opencode.json` and add `"opencode-session-guardian"` to the `plugin` array:
 
@@ -68,9 +61,9 @@ If you already have plugins:
 }
 ```
 
-### 3. Restart OpenCode
+### 2. Restart OpenCode
 
-The plugin loads automatically on startup. All protections are active immediately.
+OpenCode automatically downloads and installs plugins listed in your config from npm on startup. No manual `npm install` needed. All protections are active immediately.
 
 ## Usage
 
@@ -150,7 +143,11 @@ const MAX_IMAGE_SIZE_BYTES = 4 * 1024 * 1024; // 4MB — adjust if needed
 
 ### Plugin not loading
 
-Check that it's listed in `~/.config/opencode/opencode.json` under `"plugin"` and that the package is installed in `~/.config/opencode/node_modules/`.
+Check that it's listed in `~/.config/opencode/opencode.json` under `"plugin"`. OpenCode installs plugins automatically to `~/.opencode/node_modules/` on startup. You can verify it's there with:
+
+```bash
+ls ~/.opencode/node_modules/opencode-session-guardian/
+```
 
 ### Recovery tools not showing up
 

@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-guardian",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "OpenCode plugin that prevents session crashes from oversized images/screenshots and recovers context from broken sessions",
   "type": "module",
   "main": "index.js",
