@@ -232,8 +232,18 @@ export default {
         ];
 
         if (screenshotTools.some((t) => input.tool.includes(t))) {
-          if (output.args && output.args.fullPage === true) {
+          if (!output.args) output.args = {};
+          // Block fullPage to prevent 8000px crash
+          if (output.args.fullPage === true) {
             output.args.fullPage = false;
+          }
+          // Force JPEG at 50% quality to keep under 5MB limit
+          // PNG screenshots of complex pages easily exceed 5-6MB
+          if (!output.args.format || output.args.format === "png") {
+            output.args.format = "jpeg";
+          }
+          if (!output.args.quality || output.args.quality > 50) {
+            output.args.quality = 50;
           }
         }
       },
