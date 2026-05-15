@@ -259,87 +259,90 @@ export default {
       },
 
       // Filter oversized base64 images from message history
-      // Claude API limits: 8000px single image, 2000px when multiple images
-      // We keep max MAX_IMAGES_IN_CONTEXT images (the most recent ones)
+      // CRITICAL: NEVER touch images uploaded by the user — only filter tool outputs
+      // (screenshots from chrome-devtools, xcode, etc. can accumulate and crash sessions)
       "experimental.chat.messages.transform": async (_input, output) => {
-        const MAX_IMAGES_IN_CONTEXT = 3;
+        const MAX_TOOL_IMAGES_IN_CONTEXT = 3;
 
-        // First pass: collect all image locations
-        const allImages = [];
+        // Collect tool-generated images ONLY (skip user-uploaded ones)
+        const toolImages = [];
         for (let mi = 0; mi < output.messages.length; mi++) {
           const msg = output.messages[mi];
+          const role = msg.info?.role || msg.role;
+
+          // SKIP user messages entirely — user images must never be filtered
+          if (role === "user") continue;
+
           for (let pi = 0; pi < msg.parts.length; pi++) {
             const part = msg.parts[pi];
-            // Direct image file parts
-            if (part.type === "file" && part.url && part.url.startsWith("data:image")) {
-              allImages.push({ mi, pi, size: part.url.length, type: "file" });
-            }
+
             // Tool outputs with image attachments
             if (part.type === "tool" && part.state?.status === "completed" && part.state?.attachments) {
               for (const att of part.state.attachments) {
                 if (att.url && att.url.startsWith("data:image")) {
-                  allImages.push({ mi, pi, size: att.url.length, type: "tool-attachment" });
+                  toolImages.push({ mi, pi, size: att.url.length });
+                  break;
                 }
               }
             }
             // Tool outputs that ARE base64 images
             if (part.type === "tool" && part.state?.status === "completed" && part.state?.output) {
-              if (part.state.output.startsWith("data:image") || part.state.output.length > MAX_IMAGE_SIZE_BYTES) {
-                allImages.push({ mi, pi, size: part.state.output.length, type: "tool-output" });
+              if (part.state.output.startsWith("data:image")) {
+                toolImages.push({ mi, pi, size: part.state.output.length });
               }
             }
           }
         }
 
-        // If too many images, remove all except the last MAX_IMAGES_IN_CONTEXT
+        // Only filter if too many TOOL screenshots accumulated
         const imagesToRemove = new Set();
-        if (allImages.length > MAX_IMAGES_IN_CONTEXT) {
-          const toRemove = allImages.slice(0, allImages.length - MAX_IMAGES_IN_CONTEXT);
+        if (toolImages.length > MAX_TOOL_IMAGES_IN_CONTEXT) {
+          const toRemove = toolImages.slice(0, toolImages.length - MAX_TOOL_IMAGES_IN_CONTEXT);
           for (const img of toRemove) {
             imagesToRemove.add(`${img.mi}-${img.pi}`);
           }
         }
 
-        // Also always remove any single image >4MB
-        for (const img of allImages) {
-          if (img.size > MAX_IMAGE_SIZE_BYTES) {
-            imagesToRemove.add(`${img.mi}-${img.pi}`);
-          }
-        }
-
-        // Second pass: apply removals
+        // Apply removals to tool parts only
         if (imagesToRemove.size > 0) {
           for (let mi = 0; mi < output.messages.length; mi++) {
             const msg = output.messages[mi];
-            const newParts = [];
             for (let pi = 0; pi < msg.parts.length; pi++) {
               const part = msg.parts[pi];
               const key = `${mi}-${pi}`;
 
-              if (imagesToRemove.has(key)) {
-                if (part.type === "file") {
-                  newParts.push({
-                    ...part,
-                    type: "text",
-                    text: `[SESSION-GUARDIAN] Image removed from context to prevent crash (${allImages.length} images total, keeping last ${MAX_IMAGES_IN_CONTEXT}). File: ${part.filename || "screenshot"}`,
-                    url: undefined,
-                  });
-                } else if (part.type === "tool") {
-                  if (part.state?.output) {
-                    part.state.output = `[SESSION-GUARDIAN] Image output removed (${allImages.length} images in session, limit ${MAX_IMAGES_IN_CONTEXT}). Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
-                  }
-                  if (part.state?.attachments) {
-                    part.state.attachments = [];
-                  }
-                  newParts.push(part);
-                } else {
-                  newParts.push(part);
+              if (imagesToRemove.has(key) && part.type === "tool") {
+                if (part.state?.output && part.state.output.startsWith("data:image")) {
+                  part.state.output = `[SESSION-GUARDIAN] Old screenshot removed (${toolImages.length} tool screenshots in session, keeping last ${MAX_TOOL_IMAGES_IN_CONTEXT}). Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
                 }
-              } else {
-                newParts.push(part);
+                if (part.state?.attachments) {
+                  part.state.attachments = [];
+                }
               }
             }
-            msg.parts = newParts;
+          }
+        }
+
+        // Truncate massive tool outputs (>5MB) that aren't images
+        // This protects against accidentally huge stdout/stderr from tools
+        for (const msg of output.messages) {
+          const role = msg.info?.role || msg.role;
+          if (role === "user") continue; // never touch user content
+
+          for (const part of msg.parts) {
+            if (
+              part.type === "tool" &&
+              part.state?.status === "completed" &&
+              part.state?.output &&
+              typeof part.state.output === "string" &&
+              !part.state.output.startsWith("data:image") &&
+              part.state.output.length > MAX_IMAGE_SIZE_BYTES
+            ) {
+              part.state.output =
+                `[SESSION-GUARDIAN] Tool output truncated (${(part.state.output.length / 1024 / 1024).toFixed(1)}MB exceeded limit). ` +
+                `Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}\n\n` +
+                `First 2KB of output:\n${part.state.output.substring(0, 2000)}`;
+            }
           }
         }
       },
