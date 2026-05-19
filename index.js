@@ -44,6 +44,82 @@ function dbQuery(sql) {
 }
 
 // ============================================================================
+// Image dimension detection (PNG/JPEG headers in base64)
+// ============================================================================
+
+/**
+ * Extract width/height from a base64 data URL by parsing image headers.
+ * Returns {width, height} or null if format unknown/parse failed.
+ */
+function getImageDimensionsFromBase64(dataUrl) {
+  try {
+    if (!dataUrl || typeof dataUrl !== "string") return null;
+    const commaIdx = dataUrl.indexOf(",");
+    if (commaIdx === -1) return null;
+
+    // Only need first ~200 bytes for dimension headers
+    const headerB64 = dataUrl.substring(commaIdx + 1, commaIdx + 400);
+    const buf = Buffer.from(headerB64, "base64");
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A + IHDR chunk at byte 8
+    // Width at bytes 16-19, height at bytes 20-23 (big-endian)
+    if (
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47
+    ) {
+      const width =
+        (buf[16] << 24) | (buf[17] << 16) | (buf[18] << 8) | buf[19];
+      const height =
+        (buf[20] << 24) | (buf[21] << 16) | (buf[22] << 8) | buf[23];
+      return { width, height };
+    }
+
+    // JPEG: FF D8 FF, then markers. SOFn marker (FF C0-CF, not C4/C8/CC)
+    // contains dimensions: skip 5 bytes (marker + length + precision), then
+    // 2 bytes height, 2 bytes width (big-endian)
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+      let offset = 2;
+      while (offset < buf.length - 9) {
+        if (buf[offset] !== 0xff) {
+          offset++;
+          continue;
+        }
+        const marker = buf[offset + 1];
+        // SOF0-SOF15 markers (skip SOF4=C4=DHT and others)
+        if (
+          marker >= 0xc0 &&
+          marker <= 0xcf &&
+          marker !== 0xc4 &&
+          marker !== 0xc8 &&
+          marker !== 0xcc
+        ) {
+          const height = (buf[offset + 5] << 8) | buf[offset + 6];
+          const width = (buf[offset + 7] << 8) | buf[offset + 8];
+          return { width, height };
+        }
+        // Skip this segment
+        const segLen = (buf[offset + 2] << 8) | buf[offset + 3];
+        offset += 2 + segLen;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Quick check: does this base64 image exceed the per-image pixel limit
+ * when multiple images are present? Claude's hard limit is 2000px per
+ * dimension in multi-image requests.
+ */
+function imageExceedsMultiImageLimit(dataUrl, maxDim = 2000) {
+  const dims = getImageDimensionsFromBase64(dataUrl);
+  if (!dims) return false; // unknown format, don't filter
+  return dims.width > maxDim || dims.height > maxDim;
+}
+
+// ============================================================================
 // File-based storage (fallback)
 // ============================================================================
 
@@ -258,76 +334,100 @@ export default {
         }
       },
 
-      // Filter oversized base64 images from message history
-      // CRITICAL: NEVER touch images uploaded by the user — only filter tool outputs
-      // (screenshots from chrome-devtools, xcode, etc. can accumulate and crash sessions)
+      // Smart image filtering — keeps only images from the CURRENT TURN
+      // A "turn" = the last user message + every assistant message after it.
+      // Everything before the last user message is considered history and its
+      // images get stripped (text content is kept intact).
+      //
+      // This means:
+      //   - User can attach images freely in EACH turn (old ones auto-discarded)
+      //   - Agent can take as many screenshots as it needs in the current turn
+      //     (chrome-devtools, xcode, etc.) — old screenshots are cleared
+      //   - No accumulation across turns → no multi-image 2000px crashes
       "experimental.chat.messages.transform": async (_input, output) => {
-        const MAX_TOOL_IMAGES_IN_CONTEXT = 3;
+        // Find the index of the LAST user message — its turn is the active one
+        let lastUserMsgIdx = -1;
+        for (let mi = output.messages.length - 1; mi >= 0; mi--) {
+          const role = output.messages[mi].info?.role || output.messages[mi].role;
+          if (role === "user") {
+            lastUserMsgIdx = mi;
+            break;
+          }
+        }
 
-        // Collect tool-generated images ONLY (skip user-uploaded ones)
-        const toolImages = [];
-        for (let mi = 0; mi < output.messages.length; mi++) {
+        // Anything at index < lastUserMsgIdx is "previous turn" → strip images
+        const toRemove = new Set();
+        for (let mi = 0; mi < lastUserMsgIdx; mi++) {
           const msg = output.messages[mi];
-          const role = msg.info?.role || msg.role;
-
-          // SKIP user messages entirely — user images must never be filtered
-          if (role === "user") continue;
-
           for (let pi = 0; pi < msg.parts.length; pi++) {
             const part = msg.parts[pi];
 
-            // Tool outputs with image attachments
-            if (part.type === "tool" && part.state?.status === "completed" && part.state?.attachments) {
-              for (const att of part.state.attachments) {
-                if (att.url && att.url.startsWith("data:image")) {
-                  toolImages.push({ mi, pi, size: att.url.length });
-                  break;
-                }
-              }
+            // User-uploaded image from earlier turn
+            if (part.type === "file" && part.url && part.url.startsWith("data:image")) {
+              toRemove.add(`${mi}-${pi}`);
+              continue;
             }
-            // Tool outputs that ARE base64 images
-            if (part.type === "tool" && part.state?.status === "completed" && part.state?.output) {
-              if (part.state.output.startsWith("data:image")) {
-                toolImages.push({ mi, pi, size: part.state.output.length });
+
+            // Tool screenshot from earlier turn
+            if (part.type === "tool" && part.state?.status === "completed") {
+              const hasImageOutput =
+                part.state.output &&
+                typeof part.state.output === "string" &&
+                part.state.output.startsWith("data:image");
+              const hasImageAttachments =
+                Array.isArray(part.state.attachments) &&
+                part.state.attachments.some(
+                  (a) => a?.url && a.url.startsWith("data:image")
+                );
+              if (hasImageOutput || hasImageAttachments) {
+                toRemove.add(`${mi}-${pi}`);
               }
             }
           }
         }
 
-        // Only filter if too many TOOL screenshots accumulated
-        const imagesToRemove = new Set();
-        if (toolImages.length > MAX_TOOL_IMAGES_IN_CONTEXT) {
-          const toRemove = toolImages.slice(0, toolImages.length - MAX_TOOL_IMAGES_IN_CONTEXT);
-          for (const img of toRemove) {
-            imagesToRemove.add(`${img.mi}-${img.pi}`);
-          }
-        }
-
-        // Apply removals to tool parts only
-        if (imagesToRemove.size > 0) {
+        // Apply removals
+        if (toRemove.size > 0) {
           for (let mi = 0; mi < output.messages.length; mi++) {
             const msg = output.messages[mi];
+            const newParts = [];
             for (let pi = 0; pi < msg.parts.length; pi++) {
               const part = msg.parts[pi];
               const key = `${mi}-${pi}`;
 
-              if (imagesToRemove.has(key) && part.type === "tool") {
-                if (part.state?.output && part.state.output.startsWith("data:image")) {
-                  part.state.output = `[SESSION-GUARDIAN] Old screenshot removed (${toolImages.length} tool screenshots in session, keeping last ${MAX_TOOL_IMAGES_IN_CONTEXT}). Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
+              if (toRemove.has(key)) {
+                if (part.type === "file") {
+                  // User image from a previous turn — no longer relevant
+                  newParts.push({
+                    ...part,
+                    type: "text",
+                    text: `[SESSION-GUARDIAN] Image from earlier turn (no longer in active context). File: ${part.filename || "image"}`,
+                    url: undefined,
+                  });
+                } else if (part.type === "tool") {
+                  // Clear image content from tool parts
+                  if (part.state?.output && typeof part.state.output === "string" && part.state.output.startsWith("data:image")) {
+                    part.state.output = `[SESSION-GUARDIAN] Old screenshot cleared. Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
+                  }
+                  if (part.state?.attachments) {
+                    part.state.attachments = [];
+                  }
+                  newParts.push(part);
+                } else {
+                  newParts.push(part);
                 }
-                if (part.state?.attachments) {
-                  part.state.attachments = [];
-                }
+              } else {
+                newParts.push(part);
               }
             }
+            msg.parts = newParts;
           }
         }
 
-        // Truncate massive tool outputs (>5MB) that aren't images
-        // This protects against accidentally huge stdout/stderr from tools
+        // Truncate massive non-image tool outputs (>5MB)
         for (const msg of output.messages) {
           const role = msg.info?.role || msg.role;
-          if (role === "user") continue; // never touch user content
+          if (role === "user") continue;
 
           for (const part of msg.parts) {
             if (
@@ -336,12 +436,13 @@ export default {
               part.state?.output &&
               typeof part.state.output === "string" &&
               !part.state.output.startsWith("data:image") &&
+              !part.state.output.startsWith("[SESSION-GUARDIAN]") &&
               part.state.output.length > MAX_IMAGE_SIZE_BYTES
             ) {
               part.state.output =
-                `[SESSION-GUARDIAN] Tool output truncated (${(part.state.output.length / 1024 / 1024).toFixed(1)}MB exceeded limit). ` +
+                `[SESSION-GUARDIAN] Tool output truncated (${(part.state.output.length / 1024 / 1024).toFixed(1)}MB). ` +
                 `Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}\n\n` +
-                `First 2KB of output:\n${part.state.output.substring(0, 2000)}`;
+                `First 2KB:\n${part.state.output.substring(0, 2000)}`;
             }
           }
         }
