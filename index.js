@@ -357,7 +357,31 @@ export default {
       //     just captured)
       //   - Older turns: text preserved, images cleared
       "experimental.chat.messages.transform": async (_input, output) => {
-        // Find last user and last assistant indices
+        // ── GOLDEN RULE (learned the hard way) ──────────────────────────
+        // Anthropic signs `thinking` / `redacted_thinking` blocks. If a
+        // message contains a reasoning part, modifying ANY part of that same
+        // message (even an unrelated tool screenshot) breaks the signature
+        // and the API returns a 400 `invalid_request_error`.
+        //
+        // In OpenCode, the agent often reasons AND takes a screenshot in the
+        // SAME assistant message — so reasoning + image live together.
+        //
+        // Therefore: a message is UNTOUCHABLE if it contains a reasoning/
+        // thinking part, OR if it's the last user / last assistant message.
+        // We only strip images from "safe" messages (no thinking), which are
+        // almost always user messages carrying pasted images or tool results.
+        // ────────────────────────────────────────────────────────────────
+
+        const hasThinking = (msg) =>
+          Array.isArray(msg.parts) &&
+          msg.parts.some(
+            (p) =>
+              p.type === "reasoning" ||
+              p.type === "thinking" ||
+              p.type === "redacted_thinking"
+          );
+
+        // Last user + last assistant are always protected
         let lastUserIdx = -1;
         let lastAssistantIdx = -1;
         for (let mi = output.messages.length - 1; mi >= 0; mi--) {
@@ -367,12 +391,14 @@ export default {
           if (lastUserIdx !== -1 && lastAssistantIdx !== -1) break;
         }
 
-        // A message is "protected" (never modified) if it's the last user
-        // message OR the last assistant message. Anything else is fair game.
-        const isProtected = (mi) =>
-          mi === lastUserIdx || mi === lastAssistantIdx;
+        const isProtected = (mi) => {
+          if (mi === lastUserIdx || mi === lastAssistantIdx) return true;
+          // NEVER touch a message that carries a signed thinking block
+          if (hasThinking(output.messages[mi])) return true;
+          return false;
+        };
 
-        // Build the set of parts to strip
+        // Build the set of image parts to strip (only from safe messages)
         const toRemove = new Set();
         for (let mi = 0; mi < output.messages.length; mi++) {
           if (isProtected(mi)) continue;
@@ -381,13 +407,11 @@ export default {
           for (let pi = 0; pi < msg.parts.length; pi++) {
             const part = msg.parts[pi];
 
-            // User-uploaded image from earlier turn
             if (part.type === "file" && part.url && part.url.startsWith("data:image")) {
               toRemove.add(`${mi}-${pi}`);
               continue;
             }
 
-            // Tool screenshot from earlier turn
             if (part.type === "tool" && part.state?.status === "completed") {
               const hasImageOutput =
                 part.state.output &&
@@ -405,7 +429,7 @@ export default {
           }
         }
 
-        // Apply removals (only touches messages that are NOT protected)
+        // Apply removals (protected messages are skipped entirely)
         if (toRemove.size > 0) {
           for (let mi = 0; mi < output.messages.length; mi++) {
             if (isProtected(mi)) continue;
@@ -442,9 +466,8 @@ export default {
           }
         }
 
-        // Truncate massive non-image tool outputs (>5MB) — but NEVER touch
-        // protected messages (last user / last assistant) to preserve the
-        // thinking-block signatures Anthropic requires.
+        // Truncate massive non-image tool outputs (>5MB) — never on protected
+        // messages (thinking signatures / last turn).
         for (let mi = 0; mi < output.messages.length; mi++) {
           if (isProtected(mi)) continue;
           const msg = output.messages[mi];
