@@ -335,30 +335,49 @@ export default {
       },
 
       // Smart image filtering — keeps only images from the CURRENT TURN
-      // A "turn" = the last user message + every assistant message after it.
-      // Everything before the last user message is considered history and its
-      // images get stripped (text content is kept intact).
       //
-      // This means:
-      //   - User can attach images freely in EACH turn (old ones auto-discarded)
-      //   - Agent can take as many screenshots as it needs in the current turn
-      //     (chrome-devtools, xcode, etc.) — old screenshots are cleared
-      //   - No accumulation across turns → no multi-image 2000px crashes
+      // CRITICAL CONSTRAINT (Anthropic API):
+      // The "latest assistant message" CANNOT be modified — its `thinking` /
+      // `redacted_thinking` blocks are cryptographically signed, and any
+      // mutation (even of tool_result content) breaks the signature and
+      // causes a 400 `invalid_request_error`. We must leave the most recent
+      // assistant message entirely untouched.
+      //
+      // Strategy:
+      //   - Find the last assistant message → NEVER touch it
+      //   - Find the last user message → NEVER touch it
+      //   - For everything before the last user message AND before the last
+      //     assistant message, strip images (text is preserved)
+      //
+      // Effects:
+      //   - User can attach images freely in EACH turn (old ones discarded
+      //     once superseded by the next assistant response)
+      //   - Agent's most recent response keeps all its screenshots intact
+      //     (required for thinking-block signatures + lets agent see what it
+      //     just captured)
+      //   - Older turns: text preserved, images cleared
       "experimental.chat.messages.transform": async (_input, output) => {
-        // Find the index of the LAST user message — its turn is the active one
-        let lastUserMsgIdx = -1;
+        // Find last user and last assistant indices
+        let lastUserIdx = -1;
+        let lastAssistantIdx = -1;
         for (let mi = output.messages.length - 1; mi >= 0; mi--) {
           const role = output.messages[mi].info?.role || output.messages[mi].role;
-          if (role === "user") {
-            lastUserMsgIdx = mi;
-            break;
-          }
+          if (role === "user" && lastUserIdx === -1) lastUserIdx = mi;
+          if (role === "assistant" && lastAssistantIdx === -1) lastAssistantIdx = mi;
+          if (lastUserIdx !== -1 && lastAssistantIdx !== -1) break;
         }
 
-        // Anything at index < lastUserMsgIdx is "previous turn" → strip images
+        // A message is "protected" (never modified) if it's the last user
+        // message OR the last assistant message. Anything else is fair game.
+        const isProtected = (mi) =>
+          mi === lastUserIdx || mi === lastAssistantIdx;
+
+        // Build the set of parts to strip
         const toRemove = new Set();
-        for (let mi = 0; mi < lastUserMsgIdx; mi++) {
+        for (let mi = 0; mi < output.messages.length; mi++) {
+          if (isProtected(mi)) continue;
           const msg = output.messages[mi];
+
           for (let pi = 0; pi < msg.parts.length; pi++) {
             const part = msg.parts[pi];
 
@@ -386,9 +405,10 @@ export default {
           }
         }
 
-        // Apply removals
+        // Apply removals (only touches messages that are NOT protected)
         if (toRemove.size > 0) {
           for (let mi = 0; mi < output.messages.length; mi++) {
+            if (isProtected(mi)) continue;
             const msg = output.messages[mi];
             const newParts = [];
             for (let pi = 0; pi < msg.parts.length; pi++) {
@@ -397,7 +417,6 @@ export default {
 
               if (toRemove.has(key)) {
                 if (part.type === "file") {
-                  // User image from a previous turn — no longer relevant
                   newParts.push({
                     ...part,
                     type: "text",
@@ -405,7 +424,6 @@ export default {
                     url: undefined,
                   });
                 } else if (part.type === "tool") {
-                  // Clear image content from tool parts
                   if (part.state?.output && typeof part.state.output === "string" && part.state.output.startsWith("data:image")) {
                     part.state.output = `[SESSION-GUARDIAN] Old screenshot cleared. Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}`;
                   }
@@ -424,8 +442,12 @@ export default {
           }
         }
 
-        // Truncate massive non-image tool outputs (>5MB)
-        for (const msg of output.messages) {
+        // Truncate massive non-image tool outputs (>5MB) — but NEVER touch
+        // protected messages (last user / last assistant) to preserve the
+        // thinking-block signatures Anthropic requires.
+        for (let mi = 0; mi < output.messages.length; mi++) {
+          if (isProtected(mi)) continue;
+          const msg = output.messages[mi];
           const role = msg.info?.role || msg.role;
           if (role === "user") continue;
 
