@@ -357,52 +357,43 @@ export default {
       //     just captured)
       //   - Older turns: text preserved, images cleared
       "experimental.chat.messages.transform": async (_input, output) => {
-        // ── GOLDEN RULE (learned the hard way) ──────────────────────────
-        // Anthropic signs `thinking` / `redacted_thinking` blocks. If a
-        // message contains a reasoning part, modifying ANY part of that same
-        // message (even an unrelated tool screenshot) breaks the signature
-        // and the API returns a 400 `invalid_request_error`.
+        // ── GOLDEN RULE v2 (signature-safe) ─────────────────────────────
+        // Anthropic cryptographically signs `thinking` / `redacted_thinking`
+        // blocks, and those blocks ONLY ever appear in `assistant` messages.
+        // Modifying ANY part of an assistant message can break the signature
+        // → 400 invalid_request_error.
         //
-        // In OpenCode, the agent often reasons AND takes a screenshot in the
-        // SAME assistant message — so reasoning + image live together.
+        // So the rule is dead simple and 100% safe:
+        //   → ONLY touch role="user" messages. NEVER touch assistant.
         //
-        // Therefore: a message is UNTOUCHABLE if it contains a reasoning/
-        // thinking part, OR if it's the last user / last assistant message.
-        // We only strip images from "safe" messages (no thinking), which are
-        // almost always user messages carrying pasted images or tool results.
+        // User messages are exactly where pasted screenshots and tool_result
+        // images live, which is what causes the "2000 pixels / many-image"
+        // crash. We strip those from older user turns, keeping the latest
+        // user message intact. Assistant messages (and their thinking blocks)
+        // are never read or written, so signatures can never break.
         // ────────────────────────────────────────────────────────────────
 
-        const hasThinking = (msg) =>
-          Array.isArray(msg.parts) &&
-          msg.parts.some(
-            (p) =>
-              p.type === "reasoning" ||
-              p.type === "thinking" ||
-              p.type === "redacted_thinking"
-          );
+        const roleOf = (msg) => msg.info?.role || msg.role;
 
-        // Last user + last assistant are always protected
+        // Protect the most recent user message (the active turn)
         let lastUserIdx = -1;
-        let lastAssistantIdx = -1;
         for (let mi = output.messages.length - 1; mi >= 0; mi--) {
-          const role = output.messages[mi].info?.role || output.messages[mi].role;
-          if (role === "user" && lastUserIdx === -1) lastUserIdx = mi;
-          if (role === "assistant" && lastAssistantIdx === -1) lastAssistantIdx = mi;
-          if (lastUserIdx !== -1 && lastAssistantIdx !== -1) break;
+          if (roleOf(output.messages[mi]) === "user") {
+            lastUserIdx = mi;
+            break;
+          }
         }
 
-        const isProtected = (mi) => {
-          if (mi === lastUserIdx || mi === lastAssistantIdx) return true;
-          // NEVER touch a message that carries a signed thinking block
-          if (hasThinking(output.messages[mi])) return true;
-          return false;
-        };
+        // A user message is "safe to clean" if it's NOT the last user message.
+        const isCleanableUser = (mi) =>
+          roleOf(output.messages[mi]) === "user" && mi !== lastUserIdx;
 
-        // Build the set of image parts to strip (only from safe messages)
+        // Collect image parts to strip — ONLY from older user messages
         const toRemove = new Set();
         for (let mi = 0; mi < output.messages.length; mi++) {
-          if (isProtected(mi)) continue;
+          if (!isCleanableUser(mi)) continue;
           const msg = output.messages[mi];
+          if (!Array.isArray(msg.parts)) continue;
 
           for (let pi = 0; pi < msg.parts.length; pi++) {
             const part = msg.parts[pi];
@@ -429,10 +420,11 @@ export default {
           }
         }
 
-        // Apply removals (protected messages are skipped entirely)
+        // Apply removals — assistant messages are never iterated, so their
+        // thinking blocks are guaranteed untouched.
         if (toRemove.size > 0) {
           for (let mi = 0; mi < output.messages.length; mi++) {
-            if (isProtected(mi)) continue;
+            if (!isCleanableUser(mi)) continue;
             const msg = output.messages[mi];
             const newParts = [];
             for (let pi = 0; pi < msg.parts.length; pi++) {
@@ -463,32 +455,6 @@ export default {
               }
             }
             msg.parts = newParts;
-          }
-        }
-
-        // Truncate massive non-image tool outputs (>5MB) — never on protected
-        // messages (thinking signatures / last turn).
-        for (let mi = 0; mi < output.messages.length; mi++) {
-          if (isProtected(mi)) continue;
-          const msg = output.messages[mi];
-          const role = msg.info?.role || msg.role;
-          if (role === "user") continue;
-
-          for (const part of msg.parts) {
-            if (
-              part.type === "tool" &&
-              part.state?.status === "completed" &&
-              part.state?.output &&
-              typeof part.state.output === "string" &&
-              !part.state.output.startsWith("data:image") &&
-              !part.state.output.startsWith("[SESSION-GUARDIAN]") &&
-              part.state.output.length > MAX_IMAGE_SIZE_BYTES
-            ) {
-              part.state.output =
-                `[SESSION-GUARDIAN] Tool output truncated (${(part.state.output.length / 1024 / 1024).toFixed(1)}MB). ` +
-                `Tool: ${part.tool}. Summary: ${part.state.title || "N/A"}\n\n` +
-                `First 2KB:\n${part.state.output.substring(0, 2000)}`;
-            }
           }
         }
       },
