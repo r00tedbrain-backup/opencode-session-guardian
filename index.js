@@ -190,7 +190,7 @@ function getMessageParts(messageId) {
 // Session summarization
 // ============================================================================
 
-function summarizeSessionFromDb(sessionId, maxMessages = 20) {
+function summarizeSessionFromDb(sessionId, maxMessages = 50) {
   const messages = dbQuery(
     `SELECT m.id, json_extract(m.data, '$.role') as role, m.time_created
      FROM message m WHERE m.session_id = '${sessionId}'
@@ -235,7 +235,7 @@ function summarizeSessionFromDb(sessionId, maxMessages = 20) {
   return summary.length > 0 ? summary.join("\n\n") : null;
 }
 
-function summarizeSession(sessionId, maxMessages = 20) {
+function summarizeSession(sessionId, maxMessages = 50) {
   const dbSummary = summarizeSessionFromDb(sessionId, maxMessages);
   if (dbSummary) return dbSummary;
 
@@ -512,11 +512,11 @@ export default {
             "Recover context from a previous session by ID. Returns summary of messages, tool calls, and file changes.",
           args: {
             session_id: tool.schema.string().describe("The session ID to recover"),
-            max_messages: tool.schema.number().optional().describe("Max messages in summary (default 30)"),
+            max_messages: tool.schema.number().optional().describe("Max messages in summary (default 50)"),
           },
           async execute(args) {
             const sessionId = args.session_id;
-            const maxMessages = args.max_messages || 30;
+            const maxMessages = args.max_messages || 50;
 
             const rows = dbQuery(`SELECT id, slug, title, directory, time_created, time_updated, summary_additions, summary_deletions, summary_files FROM session WHERE id = '${sessionId}'`);
             const sessionInfo = rows[0]
@@ -586,11 +586,11 @@ export default {
               const sessions = getSessionsFromStorage(projectDir);
               if (sessions.length < 2) return "No previous sessions found to recover.";
               const prev = sessions[1];
-              return `=== AUTOMATICALLY RECOVERED CONTEXT ===\n\nPrevious session: ${prev.title || prev.slug}\nDirectory: ${prev.directory}\n\n${summarizeSession(prev.id, 30)}`;
+              return `=== AUTOMATICALLY RECOVERED CONTEXT ===\n\nPrevious session: ${prev.title || prev.slug}\nDirectory: ${prev.directory}\n\n${summarizeSession(prev.id, 50)}`;
             }
 
             const prevSession = rows[1];
-            const summary = summarizeSession(prevSession.id, 30);
+            const summary = summarizeSession(prevSession.id, 50);
 
             let diffs = "";
             try {
